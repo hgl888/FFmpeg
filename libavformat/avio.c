@@ -270,6 +270,8 @@ static const struct URLProtocol *url_find_protocol(const char *filename)
         *ptr = '\0';
 
     protocols = ffurl_get_protocols(NULL, NULL);
+    if (!protocols)
+        return NULL;
     for (i = 0; protocols[i]; i++) {
             const URLProtocol *up = protocols[i];
         if (!strcmp(proto_str, up->name)) {
@@ -282,6 +284,7 @@ static const struct URLProtocol *url_find_protocol(const char *filename)
             return up;
         }
     }
+    av_freep(&protocols);
 
     return NULL;
 }
@@ -305,13 +308,16 @@ int ffurl_alloc(URLContext **puc, const char *filename, int flags,
 
 int ffurl_open_whitelist(URLContext **puc, const char *filename, int flags,
                          const AVIOInterruptCB *int_cb, AVDictionary **options,
-                         const char *whitelist, const char* blacklist)
+                         const char *whitelist, const char* blacklist,
+                         URLContext *parent)
 {
     AVDictionary *tmp_opts = NULL;
     AVDictionaryEntry *e;
     int ret = ffurl_alloc(puc, filename, flags, int_cb);
     if (ret < 0)
         return ret;
+    if (parent)
+        av_opt_copy(*puc, parent);
     if (options &&
         (ret = av_opt_set_dict(*puc, options)) < 0)
         goto fail;
@@ -352,7 +358,7 @@ int ffurl_open(URLContext **puc, const char *filename, int flags,
                const AVIOInterruptCB *int_cb, AVDictionary **options)
 {
     return ffurl_open_whitelist(puc, filename, flags,
-                                int_cb, options, NULL, NULL);
+                                int_cb, options, NULL, NULL, NULL);
 }
 
 static inline int retry_transfer_wrapper(URLContext *h, uint8_t *buf,
