@@ -284,7 +284,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
         st  = s->streams[i];
         par = st->codecpar;
 
-#if FF_API_LAVF_CODEC_TB
+#if FF_API_LAVF_CODEC_TB && FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
         if (!st->time_base.num && st->codec->time_base.num) {
             av_log(s, AV_LOG_WARNING, "Using AVStream.codec.time_base as a "
@@ -475,16 +475,21 @@ static int init_pts(AVFormatContext *s)
 
 static int write_header_internal(AVFormatContext *s)
 {
+    if (!(s->oformat->flags & AVFMT_NOFILE) && s->pb)
+        avio_write_marker(s->pb, AV_NOPTS_VALUE, AVIO_DATA_MARKER_HEADER);
     if (s->oformat->write_header) {
         int ret = s->oformat->write_header(s);
         if (ret >= 0 && s->pb && s->pb->error < 0)
             ret = s->pb->error;
+        s->internal->write_header_ret = ret;
         if (ret < 0)
             return ret;
         if (s->flush_packets && s->pb && s->pb->error >= 0 && s->flags & AVFMT_FLAG_FLUSH_PACKETS)
             avio_flush(s->pb);
     }
     s->internal->header_written = 1;
+    if (!(s->oformat->flags & AVFMT_NOFILE) && s->pb)
+        avio_write_marker(s->pb, AV_NOPTS_VALUE, AVIO_DATA_MARKER_UNKNOWN);
     return 0;
 }
 
@@ -529,7 +534,7 @@ fail:
 #define UNCODED_FRAME_PACKET_SIZE (INT_MIN / 3 * 2 + (int)sizeof(AVFrame))
 
 
-#if FF_API_COMPUTE_PKT_FIELDS2
+#if FF_API_COMPUTE_PKT_FIELDS2 && FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
 //FIXME merge with compute_pkt_fields
 static int compute_muxer_pkt_fields(AVFormatContext *s, AVStream *st, AVPacket *pkt)
@@ -713,7 +718,7 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
     did_split = av_packet_split_side_data(pkt);
 
     if (!s->internal->header_written) {
-        ret = write_header_internal(s);
+        ret = s->internal->write_header_ret ? s->internal->write_header_ret : write_header_internal(s);
         if (ret < 0)
             goto fail;
     }
@@ -768,7 +773,7 @@ static int prepare_input_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret < 0)
         return ret;
 
-#if !FF_API_COMPUTE_PKT_FIELDS2
+#if !FF_API_COMPUTE_PKT_FIELDS2 && FF_API_LAVF_AVCTX
     /* sanitize the timestamps */
     if (!(s->oformat->flags & AVFMT_NOTIMESTAMPS)) {
         AVStream *st = s->streams[pkt->stream_index];
@@ -822,6 +827,11 @@ int av_write_frame(AVFormatContext *s, AVPacket *pkt)
 
     if (!pkt) {
         if (s->oformat->flags & AVFMT_ALLOW_FLUSH) {
+            if (!s->internal->header_written) {
+                ret = s->internal->write_header_ret ? s->internal->write_header_ret : write_header_internal(s);
+                if (ret < 0)
+                    return ret;
+            }
             ret = s->oformat->write_packet(s, NULL);
             if (s->flush_packets && s->pb && s->pb->error >= 0 && s->flags & AVFMT_FLAG_FLUSH_PACKETS)
                 avio_flush(s->pb);
@@ -832,7 +842,7 @@ int av_write_frame(AVFormatContext *s, AVPacket *pkt)
         return 1;
     }
 
-#if FF_API_COMPUTE_PKT_FIELDS2
+#if FF_API_COMPUTE_PKT_FIELDS2 && FF_API_LAVF_AVCTX
     ret = compute_muxer_pkt_fields(s, s->streams[pkt->stream_index], pkt);
 
     if (ret < 0 && !(s->oformat->flags & AVFMT_NOTIMESTAMPS))
@@ -1031,6 +1041,17 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *out,
     }
 }
 
+const AVPacket *ff_interleaved_peek(AVFormatContext *s, int stream)
+{
+    AVPacketList *pktl = s->internal->packet_buffer;
+    while (pktl) {
+        if (pktl->pkt.stream_index == stream)
+            return &pktl->pkt;
+        pktl = pktl->next;
+    }
+    return NULL;
+}
+
 /**
  * Interleave an AVPacket correctly so it can be muxed.
  * @param out the interleaved packet will be output here
@@ -1086,7 +1107,7 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
             av_log(s, AV_LOG_TRACE, "av_interleaved_write_frame size:%d dts:%s pts:%s\n",
                 pkt->size, av_ts2str(pkt->dts), av_ts2str(pkt->pts));
 
-#if FF_API_COMPUTE_PKT_FIELDS2
+#if FF_API_COMPUTE_PKT_FIELDS2 && FF_API_LAVF_AVCTX
         if ((ret = compute_muxer_pkt_fields(s, st, pkt)) < 0 && !(s->oformat->flags & AVFMT_NOTIMESTAMPS))
             goto fail;
 #endif
@@ -1152,18 +1173,21 @@ int av_write_trailer(AVFormatContext *s)
     }
 
     if (!s->internal->header_written) {
-        ret = write_header_internal(s);
+        ret = s->internal->write_header_ret ? s->internal->write_header_ret : write_header_internal(s);
         if (ret < 0)
             goto fail;
     }
 
 fail:
-    if (s->internal->header_written && s->oformat->write_trailer)
+    if (s->internal->header_written && s->oformat->write_trailer) {
+        if (!(s->oformat->flags & AVFMT_NOFILE) && s->pb)
+            avio_write_marker(s->pb, AV_NOPTS_VALUE, AVIO_DATA_MARKER_TRAILER);
         if (ret >= 0) {
         ret = s->oformat->write_trailer(s);
         } else {
             s->oformat->write_trailer(s);
         }
+    }
 
     if (s->oformat->deinit)
         s->oformat->deinit(s);

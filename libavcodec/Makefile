@@ -880,8 +880,6 @@ OBJS-$(CONFIG_LIBSPEEX_DECODER)           += libspeexdec.o
 OBJS-$(CONFIG_LIBSPEEX_ENCODER)           += libspeexenc.o
 OBJS-$(CONFIG_LIBTHEORA_ENCODER)          += libtheoraenc.o
 OBJS-$(CONFIG_LIBTWOLAME_ENCODER)         += libtwolame.o
-OBJS-$(CONFIG_LIBUTVIDEO_DECODER)         += libutvideodec.o
-OBJS-$(CONFIG_LIBUTVIDEO_ENCODER)         += libutvideoenc.o
 OBJS-$(CONFIG_LIBVO_AMRWBENC_ENCODER)     += libvo-amrwbenc.o
 OBJS-$(CONFIG_LIBVORBIS_DECODER)          += libvorbisdec.o
 OBJS-$(CONFIG_LIBVORBIS_ENCODER)          += libvorbisenc.o \
@@ -924,7 +922,8 @@ OBJS-$(CONFIG_G729_PARSER)             += g729_parser.o
 OBJS-$(CONFIG_GSM_PARSER)              += gsm_parser.o
 OBJS-$(CONFIG_H261_PARSER)             += h261_parser.o
 OBJS-$(CONFIG_H263_PARSER)             += h263_parser.o
-OBJS-$(CONFIG_H264_PARSER)             += h264_parser.o h264_parse.o h2645_parse.o
+OBJS-$(CONFIG_H264_PARSER)             += h264_parser.o h264_parse.o h2645_parse.o \
+                                          h264_ps.o h264_sei.o h264data.o
 OBJS-$(CONFIG_HEVC_PARSER)             += hevc_parser.o h2645_parse.o hevc_ps.o hevc_data.o
 OBJS-$(CONFIG_MJPEG_PARSER)            += mjpeg_parser.o
 OBJS-$(CONFIG_MLP_PARSER)              += mlp_parser.o mlp.o
@@ -992,7 +991,6 @@ SKIPHEADERS-$(CONFIG_D3D11VA)          += d3d11va.h dxva2_internal.h
 SKIPHEADERS-$(CONFIG_DXVA2)            += dxva2.h dxva2_internal.h
 SKIPHEADERS-$(CONFIG_JNI)              += ffjni.h
 SKIPHEADERS-$(CONFIG_LIBSCHROEDINGER)  += libschroedinger.h
-SKIPHEADERS-$(CONFIG_LIBUTVIDEO)       += libutvideo.h
 SKIPHEADERS-$(CONFIG_LIBVPX)           += libvpx.h
 SKIPHEADERS-$(CONFIG_LIBWEBP_ENCODER)  += libwebpenc_common.h
 SKIPHEADERS-$(CONFIG_MEDIACODEC)       += mediacodecdec.h mediacodec_wrapper.h mediacodec_sw_buffer.h
@@ -1041,7 +1039,7 @@ HOSTPROGS = aacps_tablegen                                              \
 
 CLEANFILES = *_tables.c *_tables.h *_tablegen$(HOSTEXESUF)
 
-$(SUBDIR)dct-test$(EXESUF): $(SUBDIR)dctref.o $(SUBDIR)aandcttab.o
+$(SUBDIR)tests/dct$(EXESUF): $(SUBDIR)dctref.o $(SUBDIR)aandcttab.o
 $(SUBDIR)dv_tablegen$(HOSTEXESUF): $(SUBDIR)dvdata_host.o
 
 TRIG_TABLES  = cos cos_fixed sin

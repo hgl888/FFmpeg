@@ -124,6 +124,7 @@ struct AVFormatInternal {
      * Whether or not a header has already been written
      */
     int header_written;
+    int write_header_ret;
 };
 
 struct AVStreamInternal {
@@ -563,7 +564,7 @@ int ffio_open2_wrapper(struct AVFormatContext *s, AVIOContext **pb, const char *
 
 /*
  * A wrapper around AVFormatContext.io_close that should be used
- * intead of calling the pointer directly.
+ * instead of calling the pointer directly.
  */
 void ff_format_io_close(AVFormatContext *s, AVIOContext **pb);
 
@@ -618,5 +619,15 @@ int ff_get_packet_palette(AVFormatContext *s, AVPacket *pkt, int ret, uint32_t *
  * Finalize buf into extradata and set its size appropriately.
  */
 int ff_bprint_to_codecpar_extradata(AVCodecParameters *par, struct AVBPrint *buf);
+
+/**
+ * Find the next packet in the interleaving queue for the given stream.
+ * The packet is not removed from the interleaving queue, but only
+ * a pointer to it is returned.
+ *
+ * @return a pointer to the next packet, or NULL if no packet is queued
+ *         for this stream.
+ */
+const AVPacket *ff_interleaved_peek(AVFormatContext *s, int stream);
 
 #endif /* AVFORMAT_INTERNAL_H */
