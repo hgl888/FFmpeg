@@ -16,6 +16,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
+
 #include <stdint.h>
 #include <string.h>
 
@@ -125,13 +127,6 @@ static int vdpau_init_pixmfts(AVHWDeviceContext *ctx)
     return 0;
 }
 
-static int vdpau_device_init(AVHWDeviceContext *ctx)
-{
-    AVVDPAUDeviceContext *hwctx = ctx->hwctx;
-    VDPAUDeviceContext   *priv  = ctx->internal->priv;
-    VdpStatus             err;
-    int                   ret;
-
 #define GET_CALLBACK(id, result)                                                \
 do {                                                                            \
     void *tmp;                                                                  \
@@ -140,15 +135,22 @@ do {                                                                            
         av_log(ctx, AV_LOG_ERROR, "Error getting the " #id " callback.\n");     \
         return AVERROR_UNKNOWN;                                                 \
     }                                                                           \
-    priv->result = tmp;                                                         \
+    result = tmp;                                                               \
 } while (0)
 
+static int vdpau_device_init(AVHWDeviceContext *ctx)
+{
+    AVVDPAUDeviceContext *hwctx = ctx->hwctx;
+    VDPAUDeviceContext   *priv  = ctx->internal->priv;
+    VdpStatus             err;
+    int                   ret;
+
     GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_QUERY_GET_PUT_BITS_Y_CB_CR_CAPABILITIES,
-                 get_transfer_caps);
-    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_GET_BITS_Y_CB_CR, get_data);
-    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_PUT_BITS_Y_CB_CR, put_data);
-    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_CREATE,           surf_create);
-    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_DESTROY,          surf_destroy);
+                 priv->get_transfer_caps);
+    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_GET_BITS_Y_CB_CR, priv->get_data);
+    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_PUT_BITS_Y_CB_CR, priv->put_data);
+    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_CREATE,           priv->surf_create);
+    GET_CALLBACK(VDP_FUNC_ID_VIDEO_SURFACE_DESTROY,          priv->surf_destroy);
 
     ret = vdpau_init_pixmfts(ctx);
     if (ret < 0) {
@@ -302,7 +304,7 @@ static int vdpau_transfer_data_from(AVHWFramesContext *ctx, AVFrame *dst,
 
     for (i = 0; i< FF_ARRAY_ELEMS(data) && dst->data[i]; i++) {
         data[i] = dst->data[i];
-        if (dst->linesize[i] < 0 || (uint64_t)dst->linesize > UINT32_MAX) {
+        if (dst->linesize[i] < 0 || dst->linesize[i] > UINT32_MAX) {
             av_log(ctx, AV_LOG_ERROR,
                    "The linesize %d cannot be represented as uint32\n",
                    dst->linesize[i]);
@@ -353,7 +355,7 @@ static int vdpau_transfer_data_to(AVHWFramesContext *ctx, AVFrame *dst,
 
     for (i = 0; i< FF_ARRAY_ELEMS(data) && src->data[i]; i++) {
         data[i] = src->data[i];
-        if (src->linesize[i] < 0 || (uint64_t)src->linesize > UINT32_MAX) {
+        if (src->linesize[i] < 0 || src->linesize[i] > UINT32_MAX) {
             av_log(ctx, AV_LOG_ERROR,
                    "The linesize %d cannot be represented as uint32\n",
                    src->linesize[i]);
@@ -388,6 +390,71 @@ static int vdpau_transfer_data_to(AVHWFramesContext *ctx, AVFrame *dst,
     return 0;
 }
 
+#if HAVE_VDPAU_X11
+#include <vdpau/vdpau_x11.h>
+#include <X11/Xlib.h>
+
+typedef struct VDPAUDevicePriv {
+    VdpDeviceDestroy *device_destroy;
+    Display *dpy;
+} VDPAUDevicePriv;
+
+static void vdpau_device_free(AVHWDeviceContext *ctx)
+{
+    AVVDPAUDeviceContext *hwctx = ctx->hwctx;
+    VDPAUDevicePriv       *priv = ctx->user_opaque;
+
+    if (priv->device_destroy)
+        priv->device_destroy(hwctx->device);
+    if (priv->dpy)
+        XCloseDisplay(priv->dpy);
+    av_freep(&priv);
+}
+
+static int vdpau_device_create(AVHWDeviceContext *ctx, const char *device,
+                               AVDictionary *opts, int flags)
+{
+    AVVDPAUDeviceContext *hwctx = ctx->hwctx;
+
+    VDPAUDevicePriv *priv;
+    VdpStatus err;
+    VdpGetInformationString *get_information_string;
+    const char *display, *vendor;
+
+    priv = av_mallocz(sizeof(*priv));
+    if (!priv)
+        return AVERROR(ENOMEM);
+
+    ctx->user_opaque = priv;
+    ctx->free        = vdpau_device_free;
+
+    priv->dpy = XOpenDisplay(device);
+    if (!priv->dpy) {
+        av_log(ctx, AV_LOG_ERROR, "Cannot open the X11 display %s.\n",
+               XDisplayName(device));
+        return AVERROR_UNKNOWN;
+    }
+    display = XDisplayString(priv->dpy);
+
+    err = vdp_device_create_x11(priv->dpy, XDefaultScreen(priv->dpy),
+                                &hwctx->device, &hwctx->get_proc_address);
+    if (err != VDP_STATUS_OK) {
+        av_log(ctx, AV_LOG_ERROR, "VDPAU device creation on X11 display %s failed.\n",
+               display);
+        return AVERROR_UNKNOWN;
+    }
+
+    GET_CALLBACK(VDP_FUNC_ID_GET_INFORMATION_STRING, get_information_string);
+    GET_CALLBACK(VDP_FUNC_ID_DEVICE_DESTROY,         priv->device_destroy);
+
+    get_information_string(&vendor);
+    av_log(ctx, AV_LOG_VERBOSE, "Successfully created a VDPAU device (%s) on "
+           "X11 display %s\n", vendor, display);
+
+    return 0;
+}
+#endif
+
 const HWContextType ff_hwcontext_type_vdpau = {
     .type                 = AV_HWDEVICE_TYPE_VDPAU,
     .name                 = "VDPAU",
@@ -396,6 +463,9 @@ const HWContextType ff_hwcontext_type_vdpau = {
     .device_priv_size     = sizeof(VDPAUDeviceContext),
     .frames_priv_size     = sizeof(VDPAUFramesContext),
 
+#if HAVE_VDPAU_X11
+    .device_create        = vdpau_device_create,
+#endif
     .device_init          = vdpau_device_init,
     .device_uninit        = vdpau_device_uninit,
     .frames_init          = vdpau_frames_init,

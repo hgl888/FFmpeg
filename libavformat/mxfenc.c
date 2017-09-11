@@ -120,6 +120,45 @@ static void mxf_write_mpegvideo_desc(AVFormatContext *s, AVStream *st);
 static void mxf_write_cdci_desc(AVFormatContext *s, AVStream *st);
 static void mxf_write_generic_sound_desc(AVFormatContext *s, AVStream *st);
 
+enum {
+    INDEX_MPEG2 = 0,
+    INDEX_AES3,
+    INDEX_WAV,
+    INDEX_D10_625_50_50_VIDEO,
+    INDEX_D10_625_50_50_AUDIO,
+    INDEX_D10_525_60_50_VIDEO,
+    INDEX_D10_525_60_50_AUDIO,
+    INDEX_D10_625_50_40_VIDEO,
+    INDEX_D10_625_50_40_AUDIO,
+    INDEX_D10_525_60_40_VIDEO,
+    INDEX_D10_525_60_40_AUDIO,
+    INDEX_D10_625_50_30_VIDEO,
+    INDEX_D10_625_50_30_AUDIO,
+    INDEX_D10_525_60_30_VIDEO,
+    INDEX_D10_525_60_30_AUDIO,
+    INDEX_DV,
+    INDEX_DV25_525_60,
+    INDEX_DV25_625_50,
+    INDEX_DV50_525_60,
+    INDEX_DV50_625_50,
+    INDEX_DV100_1080_60,
+    INDEX_DV100_1080_50,
+    INDEX_DV100_720_60,
+    INDEX_DV100_720_50,
+    INDEX_DNXHD_1080p_10bit_HIGH,
+    INDEX_DNXHD_1080p_8bit_MEDIUM,
+    INDEX_DNXHD_1080p_8bit_HIGH,
+    INDEX_DNXHD_1080i_10bit_HIGH,
+    INDEX_DNXHD_1080i_8bit_MEDIUM,
+    INDEX_DNXHD_1080i_8bit_HIGH,
+    INDEX_DNXHD_720p_10bit,
+    INDEX_DNXHD_720p_8bit_HIGH,
+    INDEX_DNXHD_720p_8bit_MEDIUM,
+    INDEX_DNXHD_720p_8bit_LOW,
+    INDEX_JPEG2000,
+    INDEX_H264,
+};
+
 static const MXFContainerEssenceEntry mxf_essence_container_uls[] = {
     { { 0x06,0x0E,0x2B,0x34,0x04,0x01,0x01,0x02,0x0D,0x01,0x03,0x01,0x02,0x04,0x60,0x01 },
       { 0x06,0x0E,0x2B,0x34,0x01,0x02,0x01,0x01,0x0D,0x01,0x03,0x01,0x15,0x01,0x05,0x00 },
@@ -352,6 +391,7 @@ static const uint8_t multiple_desc_ul[]     = { 0x06,0x0E,0x2B,0x34,0x04,0x01,0x
 
 /**
  * SMPTE RP210 http://www.smpte-ra.org/mdd/index.html
+ *             https://smpte-ra.org/sites/default/files/Labels.xml
  */
 static const MXFLocalTagPair mxf_local_tag_batch[] = {
     // preface set
@@ -671,7 +711,7 @@ static uint64_t mxf_utf16len(const char *utf8_str)
             size += 2;
         continue;
 invalid:
-        av_log(NULL, AV_LOG_ERROR, "Invaid UTF8 sequence in mxf_utf16len\n\n");
+        av_log(NULL, AV_LOG_ERROR, "Invalid UTF8 sequence in mxf_utf16len\n\n");
     }
     size += 1;
     return size;
@@ -1168,8 +1208,6 @@ static void mxf_write_generic_sound_common(AVFormatContext *s, AVStream *st, con
             av_log(s, AV_LOG_WARNING, "d10_channelcount shall be set to 4 or 8 : the output will not comply to MXF D-10 specs\n");
         avio_wb32(pb, mxf->channel_count);
     } else {
-        if (show_warnings && mxf->channel_count != -1 && s->oformat != &ff_mxf_opatom_muxer)
-            av_log(s, AV_LOG_ERROR, "-d10_channelcount requires MXF D-10 and will be ignored\n");
         avio_wb32(pb, st->codecpar->channels);
     }
 
@@ -1681,37 +1719,37 @@ AVPacket *pkt)
 
     switch (cid) {
     case 1235:
-        sc->index = 24;
+        sc->index = INDEX_DNXHD_1080p_10bit_HIGH;
         sc->component_depth = 10;
         break;
     case 1237:
-        sc->index = 25;
+        sc->index = INDEX_DNXHD_1080p_8bit_MEDIUM;
         break;
     case 1238:
-        sc->index = 26;
+        sc->index = INDEX_DNXHD_1080p_8bit_HIGH;
         break;
     case 1241:
-        sc->index = 27;
+        sc->index = INDEX_DNXHD_1080i_10bit_HIGH;
         sc->component_depth = 10;
         break;
     case 1242:
-        sc->index = 28;
+        sc->index = INDEX_DNXHD_1080i_8bit_MEDIUM;
         break;
     case 1243:
-        sc->index = 29;
+        sc->index = INDEX_DNXHD_1080i_8bit_HIGH;
         break;
     case 1250:
-        sc->index = 30;
+        sc->index = INDEX_DNXHD_720p_10bit;
         sc->component_depth = 10;
         break;
     case 1251:
-        sc->index = 31;
+        sc->index = INDEX_DNXHD_720p_8bit_HIGH;
         break;
     case 1252:
-        sc->index = 32;
+        sc->index = INDEX_DNXHD_720p_8bit_MEDIUM;
         break;
     case 1253:
-        sc->index = 33;
+        sc->index = INDEX_DNXHD_720p_8bit_LOW;
         break;
     default:
         return -1;
@@ -1772,7 +1810,7 @@ static int mxf_parse_dv_frame(AVFormatContext *s, AVStream *st, AVPacket *pkt)
 
     switch (stype) {
     case 0x18: // DV100 720p
-        ul_index = 6 + pal;
+        ul_index = INDEX_DV100_720_50 + pal;
         frame_size = pal ? 288000 : 240000;
         if (sc->interlaced) {
             av_log(s, AV_LOG_ERROR, "source marked as interlaced but codec profile is progressive\n");
@@ -1780,19 +1818,19 @@ static int mxf_parse_dv_frame(AVFormatContext *s, AVStream *st, AVPacket *pkt)
         }
         break;
     case 0x14: // DV100 1080i
-        ul_index = 4 + pal;
+        ul_index = INDEX_DV100_1080_50 + pal;
         frame_size = pal ? 576000 : 480000;
         break;
     case 0x04: // DV50
-        ul_index = 2 + pal;
+        ul_index = INDEX_DV50_525_60 + pal;
         frame_size = pal ? 288000 : 240000;
         break;
     default: // DV25
-        ul_index = 0 + pal;
+        ul_index = INDEX_DV25_525_60 + pal;
         frame_size = pal ? 144000 : 120000;
     }
 
-    sc->index = ul_index + 16;
+    sc->index = ul_index;
     sc->codec_ul =  &mxf_essence_container_uls[sc->index].codec_ul;
 
     if(s->oformat == &ff_mxf_opatom_muxer) {
@@ -1822,6 +1860,7 @@ static const struct {
     int profile;
     uint8_t interlaced;
 } mxf_h264_codec_uls[] = {
+    {{ 0x06,0x0E,0x2B,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x31,0x11,0x01 },      0,  66, 0 }, // AVC Baseline, Unconstrained Coding
     {{ 0x06,0x0E,0x2B,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x32,0x20,0x01 },      0, 110, 0 }, // AVC High 10 Intra
     {{ 0x06,0x0E,0x2B,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x32,0x21,0x01 }, 232960,   0, 1 }, // AVC Intra 50 1080i60
     {{ 0x06,0x0E,0x2B,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x32,0x21,0x02 }, 281088,   0, 1 }, // AVC Intra 50 1080i50
@@ -1860,11 +1899,11 @@ static int mxf_parse_h264_frame(AVFormatContext *s, AVStream *st,
             break;
         --buf;
         switch (state & 0x1f) {
-        case NAL_SPS:
+        case H264_NAL_SPS:
             st->codecpar->profile = buf[1];
             e->flags |= 0x40;
             break;
-        case NAL_PPS:
+        case H264_NAL_PPS:
             if (e->flags & 0x40) { // sequence header present
                 e->flags |= 0x80; // random access
                 extra_size = 0;
@@ -2101,16 +2140,20 @@ static int mxf_write_header(AVFormatContext *s)
 
             sc->video_bit_rate = st->codecpar->bit_rate;
             if (s->oformat == &ff_mxf_d10_muxer) {
+                if (st->codecpar->codec_id != AV_CODEC_ID_MPEG2VIDEO) {
+                    av_log(s, AV_LOG_ERROR, "error MXF D-10 only support MPEG-2 Video\n");
+                    return AVERROR(EINVAL);
+                }
                 if ((sc->video_bit_rate == 50000000) && (mxf->time_base.den == 25)) {
-                    sc->index = 3;
+                    sc->index = INDEX_D10_625_50_50_VIDEO;
                 } else if ((sc->video_bit_rate == 49999840 || sc->video_bit_rate == 50000000) && (mxf->time_base.den != 25)) {
-                    sc->index = 5;
+                    sc->index = INDEX_D10_525_60_50_VIDEO;
                 } else if (sc->video_bit_rate == 40000000) {
-                    if (mxf->time_base.den == 25) sc->index = 7;
-                    else                          sc->index = 9;
+                    if (mxf->time_base.den == 25) sc->index = INDEX_D10_625_50_40_VIDEO;
+                    else                          sc->index = INDEX_D10_525_60_40_VIDEO;
                 } else if (sc->video_bit_rate == 30000000) {
-                    if (mxf->time_base.den == 25) sc->index = 11;
-                    else                          sc->index = 13;
+                    if (mxf->time_base.den == 25) sc->index = INDEX_D10_625_50_30_VIDEO;
+                    else                          sc->index = INDEX_D10_525_60_30_VIDEO;
                 } else {
                     av_log(s, AV_LOG_ERROR, "error MXF D-10 only support 30/40/50 mbit/s\n");
                     return -1;
@@ -2168,7 +2211,7 @@ static int mxf_write_header(AVFormatContext *s)
 
                 mxf->timecode_base = (tbc.den + tbc.num/2) / tbc.num;
                 mxf->edit_unit_byte_count = (av_get_bits_per_sample(st->codecpar->codec_id) * st->codecpar->channels) >> 3;
-                sc->index = 2;
+                sc->index = INDEX_WAV;
             } else {
                 mxf->slice_count = 1;
             }
@@ -2549,7 +2592,7 @@ static int mxf_write_footer(AVFormatContext *s)
     mxf_write_klv_fill(s);
     mxf_write_random_index_pack(s);
 
-    if (s->pb->seekable) {
+    if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         if (s->oformat == &ff_mxf_opatom_muxer){
             /* rewrite body partition to update lengths */
             avio_seek(pb, mxf->body_partition_offset[0], SEEK_SET);

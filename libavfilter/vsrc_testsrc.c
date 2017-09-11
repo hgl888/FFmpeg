@@ -66,6 +66,9 @@ typedef struct TestSourceContext {
     /* only used by testsrc */
     int nb_decimals;
 
+    /* only used by testsrc2 */
+    int alpha;
+
     /* only used by color */
     FFDrawContext draw;
     FFDrawColor color;
@@ -685,6 +688,7 @@ AVFilter ff_vsrc_testsrc = {
 
 static const AVOption testsrc2_options[] = {
     COMMON_OPTIONS
+    { "alpha", "set global alpha (opacity)", OFFSET(alpha), AV_OPT_TYPE_INT, {.i64 = 255}, 0, 255, FLAGS },
     { NULL }
 };
 
@@ -735,6 +739,7 @@ static void test2_fill_picture(AVFilterContext *ctx, AVFrame *frame)
 {
     TestSourceContext *s = ctx->priv;
     FFDrawColor color;
+    unsigned alpha = (uint32_t)s->alpha << 24;
 
     /* colored background */
     {
@@ -746,7 +751,8 @@ static void test2_fill_picture(AVFilterContext *ctx, AVFrame *frame)
             x2 = ff_draw_round_to_sub(&s->draw, 0, 0, x2);
             set_color(s, &color, ((i & 1) ? 0xFF0000 : 0) |
                                  ((i & 2) ? 0x00FF00 : 0) |
-                                 ((i & 4) ? 0x0000FF : 0));
+                                 ((i & 4) ? 0x0000FF : 0) |
+                                 alpha);
             ff_fill_rectangle(&s->draw, &color, frame->data, frame->linesize,
                               x, 0, x2 - x, frame->height);
             x = x2;
@@ -763,7 +769,7 @@ static void test2_fill_picture(AVFilterContext *ctx, AVFrame *frame)
         g0 = av_rescale_q(s->pts, s->time_base, av_make_q(1, 128));
         for (x = 0; x < s->w; x += dx) {
             g = (av_rescale(x, 6 * 256, s->w) + g0) % (6 * 256);
-            set_color(s, &color, color_gradient(g));
+            set_color(s, &color, color_gradient(g) | alpha);
             y = y0 + av_rescale(x, s->h / 2, s->w);
             y %= 2 * (s->h - 16);
             if (y > s->h - 16)
@@ -785,7 +791,7 @@ static void test2_fill_picture(AVFilterContext *ctx, AVFrame *frame)
         int c, i;
 
         for (c = 0; c < 3; c++) {
-            set_color(s, &color, 0xBBBBBB ^ (0xFF << (c << 3)));
+            set_color(s, &color, (0xBBBBBB ^ (0xFF << (c << 3))) | alpha);
             pos = av_rescale_q(s->pts, s->time_base, av_make_q(64 >> (c << 1), cycle)) % cycle;
             xh = pos < 1 * l ? pos :
                  pos < 2 * l ? l :
@@ -1070,6 +1076,182 @@ AVFilter ff_vsrc_rgbtestsrc = {
 
 #endif /* CONFIG_RGBTESTSRC_FILTER */
 
+#if CONFIG_YUVTESTSRC_FILTER
+
+#define yuvtestsrc_options options
+AVFILTER_DEFINE_CLASS(yuvtestsrc);
+
+static void yuvtest_fill_picture8(AVFilterContext *ctx, AVFrame *frame)
+{
+    int x, y, w = frame->width, h = frame->height / 3;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    const int factor = 1 << desc->comp[0].depth;
+    const int mid = 1 << (desc->comp[0].depth - 1);
+    uint8_t *ydst = frame->data[0];
+    uint8_t *udst = frame->data[1];
+    uint8_t *vdst = frame->data[2];
+    int ylinesize = frame->linesize[0];
+    int ulinesize = frame->linesize[1];
+    int vlinesize = frame->linesize[2];
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int c = factor * x / w;
+
+            ydst[x] = c;
+            udst[x] = mid;
+            vdst[x] = mid;
+        }
+
+        ydst += ylinesize;
+        udst += ulinesize;
+        vdst += vlinesize;
+    }
+
+    h += h;
+    for (; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int c = factor * x / w;
+
+            ydst[x] = mid;
+            udst[x] = c;
+            vdst[x] = mid;
+        }
+
+        ydst += ylinesize;
+        udst += ulinesize;
+        vdst += vlinesize;
+    }
+
+    for (; y < frame->height; y++) {
+        for (x = 0; x < w; x++) {
+            int c = factor * x / w;
+
+            ydst[x] = mid;
+            udst[x] = mid;
+            vdst[x] = c;
+        }
+
+        ydst += ylinesize;
+        udst += ulinesize;
+        vdst += vlinesize;
+    }
+}
+
+static void yuvtest_fill_picture16(AVFilterContext *ctx, AVFrame *frame)
+{
+    int x, y, w = frame->width, h = frame->height / 3;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    const int factor = 1 << desc->comp[0].depth;
+    const int mid = 1 << (desc->comp[0].depth - 1);
+    uint16_t *ydst = (uint16_t *)frame->data[0];
+    uint16_t *udst = (uint16_t *)frame->data[1];
+    uint16_t *vdst = (uint16_t *)frame->data[2];
+    int ylinesize = frame->linesize[0] / 2;
+    int ulinesize = frame->linesize[1] / 2;
+    int vlinesize = frame->linesize[2] / 2;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int c = factor * x / w;
+
+            ydst[x] = c;
+            udst[x] = mid;
+            vdst[x] = mid;
+        }
+
+        ydst += ylinesize;
+        udst += ulinesize;
+        vdst += vlinesize;
+    }
+
+    h += h;
+    for (; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int c = factor * x / w;
+
+            ydst[x] = mid;
+            udst[x] = c;
+            vdst[x] = mid;
+        }
+
+        ydst += ylinesize;
+        udst += ulinesize;
+        vdst += vlinesize;
+    }
+
+    for (; y < frame->height; y++) {
+        for (x = 0; x < w; x++) {
+            int c = factor * x / w;
+
+            ydst[x] = mid;
+            udst[x] = mid;
+            vdst[x] = c;
+        }
+
+        ydst += ylinesize;
+        udst += ulinesize;
+        vdst += vlinesize;
+    }
+}
+
+static av_cold int yuvtest_init(AVFilterContext *ctx)
+{
+    TestSourceContext *test = ctx->priv;
+
+    test->draw_once = 1;
+    return init(ctx);
+}
+
+static int yuvtest_query_formats(AVFilterContext *ctx)
+{
+    static const enum AVPixelFormat pix_fmts[] = {
+        AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUVJ444P,
+        AV_PIX_FMT_YUV444P9, AV_PIX_FMT_YUV444P10,
+        AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV444P14,
+        AV_PIX_FMT_YUV444P16,
+        AV_PIX_FMT_NONE
+    };
+
+    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
+    if (!fmts_list)
+        return AVERROR(ENOMEM);
+    return ff_set_common_formats(ctx, fmts_list);
+}
+
+static int yuvtest_config_props(AVFilterLink *outlink)
+{
+    TestSourceContext *test = outlink->src->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(outlink->format);
+
+    test->fill_picture_fn = desc->comp[0].depth > 8 ? yuvtest_fill_picture16 : yuvtest_fill_picture8;
+    return config_props(outlink);
+}
+
+static const AVFilterPad avfilter_vsrc_yuvtestsrc_outputs[] = {
+    {
+        .name          = "default",
+        .type          = AVMEDIA_TYPE_VIDEO,
+        .request_frame = request_frame,
+        .config_props  = yuvtest_config_props,
+    },
+    { NULL }
+};
+
+AVFilter ff_vsrc_yuvtestsrc = {
+    .name          = "yuvtestsrc",
+    .description   = NULL_IF_CONFIG_SMALL("Generate YUV test pattern."),
+    .priv_size     = sizeof(TestSourceContext),
+    .priv_class    = &yuvtestsrc_class,
+    .init          = yuvtest_init,
+    .uninit        = uninit,
+    .query_formats = yuvtest_query_formats,
+    .inputs        = NULL,
+    .outputs       = avfilter_vsrc_yuvtestsrc_outputs,
+};
+
+#endif /* CONFIG_YUVTESTSRC_FILTER */
+
 #if CONFIG_SMPTEBARS_FILTER || CONFIG_SMPTEHDBARS_FILTER
 
 static const uint8_t rainbow[7][4] = {
@@ -1133,8 +1315,8 @@ static void draw_bar(TestSourceContext *test, const uint8_t color[4],
 
     x = FFMIN(x, test->w - 1);
     y = FFMIN(y, test->h - 1);
-    w = FFMIN(w, test->w - x);
-    h = FFMIN(h, test->h - y);
+    w = FFMAX(FFMIN(w, test->w - x), 0);
+    h = FFMAX(FFMIN(h, test->h - y), 0);
 
     av_assert0(x + w <= test->w);
     av_assert0(y + h <= test->h);
@@ -1200,7 +1382,7 @@ static void smptebars_fill_picture(AVFilterContext *ctx, AVFrame *picref)
     int r_w, r_h, w_h, p_w, p_h, i, tmp, x = 0;
     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(picref->format);
 
-    av_frame_set_colorspace(picref, AVCOL_SPC_BT470BG);
+    picref->colorspace = AVCOL_SPC_BT470BG;
 
     r_w = FFALIGN((test->w + 6) / 7, 1 << pixdesc->log2_chroma_w);
     r_h = FFALIGN(test->h * 2 / 3, 1 << pixdesc->log2_chroma_h);
@@ -1267,7 +1449,7 @@ static void smptehdbars_fill_picture(AVFilterContext *ctx, AVFrame *picref)
     int d_w, r_w, r_h, l_w, i, tmp, x = 0, y = 0;
     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(picref->format);
 
-    av_frame_set_colorspace(picref, AVCOL_SPC_BT709);
+    picref->colorspace = AVCOL_SPC_BT709;
 
     d_w = FFALIGN(test->w / 8, 1 << pixdesc->log2_chroma_w);
     r_h = FFALIGN(test->h * 7 / 12, 1 << pixdesc->log2_chroma_h);

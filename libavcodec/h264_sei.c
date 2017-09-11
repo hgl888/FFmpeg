@@ -28,9 +28,11 @@
 #include "avcodec.h"
 #include "get_bits.h"
 #include "golomb.h"
-#include "h264.h"
+#include "h264_ps.h"
 #include "h264_sei.h"
 #include "internal.h"
+
+#define AVERROR_PS_NOT_FOUND      FFERRTAG(0xF8,'?','P','S')
 
 static const uint8_t sei_num_clock_ts_table[9] = {
     1, 1, 1, 2, 2, 3, 3, 2, 3
@@ -43,6 +45,7 @@ void ff_h264_sei_uninit(H264SEIContext *h)
     h->picture_timing.dpb_output_delay  = 0;
     h->picture_timing.cpb_removal_delay = -1;
 
+    h->picture_timing.present      = 0;
     h->buffering_period.present    = 0;
     h->frame_packing.present       = 0;
     h->display_orientation.present = 0;
@@ -64,7 +67,7 @@ static int decode_picture_timing(H264SEIPictureTiming *h, GetBitContext *gb,
 
     if (!sps) {
         av_log(logctx, AV_LOG_ERROR, "SPS unavailable in decode_picture_timing\n");
-        return 0;
+        return AVERROR_PS_NOT_FOUND;
     }
 
     if (sps->nal_hrd_parameters_present_flag ||
@@ -117,6 +120,8 @@ static int decode_picture_timing(H264SEIPictureTiming *h, GetBitContext *gb,
         av_log(logctx, AV_LOG_DEBUG, "ct_type:%X pic_struct:%d\n",
                h->ct_type, h->pic_struct);
     }
+
+    h->present = 1;
     return 0;
 }
 
@@ -276,15 +281,15 @@ static int decode_buffering_period(H264SEIBufferingPeriod *h, GetBitContext *gb,
 {
     unsigned int sps_id;
     int sched_sel_idx;
-    SPS *sps;
+    const SPS *sps;
 
     sps_id = get_ue_golomb_31(gb);
     if (sps_id > 31 || !ps->sps_list[sps_id]) {
         av_log(logctx, AV_LOG_ERROR,
                "non-existing SPS %d referenced in buffering period\n", sps_id);
-        return AVERROR_INVALIDDATA;
+        return sps_id > 31 ? AVERROR_INVALIDDATA : AVERROR_PS_NOT_FOUND;
     }
-    sps = (SPS*)ps->sps_list[sps_id]->data;
+    sps = (const SPS*)ps->sps_list[sps_id]->data;
 
     // NOTE: This is really so duplicated in the standard... See H.264, D.1.1
     if (sps->nal_hrd_parameters_present_flag) {
@@ -377,9 +382,19 @@ static int decode_green_metadata(H264SEIGreenMetaData *h, GetBitContext *gb)
     return 0;
 }
 
+static int decode_alternative_transfer(H264SEIAlternativeTransfer *h,
+                                       GetBitContext *gb)
+{
+    h->present = 1;
+    h->preferred_transfer_characteristics = get_bits(gb, 8);
+    return 0;
+}
+
 int ff_h264_sei_decode(H264SEIContext *h, GetBitContext *gb,
                        const H264ParamSets *ps, void *logctx)
 {
+    int master_ret = 0;
+
     while (get_bits_left(gb) > 16 && show_bits(gb, 16)) {
         int type = 0;
         unsigned size = 0;
@@ -430,11 +445,16 @@ int ff_h264_sei_decode(H264SEIContext *h, GetBitContext *gb,
         case SEI_TYPE_GREEN_METADATA:
             ret = decode_green_metadata(&h->green_metadata, gb);
             break;
+        case SEI_TYPE_ALTERNATIVE_TRANSFER:
+            ret = decode_alternative_transfer(&h->alternative_transfer, gb);
+            break;
         default:
             av_log(logctx, AV_LOG_DEBUG, "unknown SEI type %d\n", type);
         }
-        if (ret < 0)
+        if (ret < 0 && ret != AVERROR_PS_NOT_FOUND)
             return ret;
+        if (ret < 0)
+            master_ret = ret;
 
         skip_bits_long(gb, next - get_bits_count(gb));
 
@@ -442,7 +462,7 @@ int ff_h264_sei_decode(H264SEIContext *h, GetBitContext *gb,
         align_get_bits(gb);
     }
 
-    return 0;
+    return master_ret;
 }
 
 const char *ff_h264_sei_stereo_mode(const H264SEIFramePacking *h)

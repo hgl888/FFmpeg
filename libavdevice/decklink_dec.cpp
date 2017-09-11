@@ -1,6 +1,7 @@
 /*
- * Blackmagic DeckLink output
+ * Blackmagic DeckLink input
  * Copyright (c) 2013-2014 Luca Barbato, Deti Fliegl
+ * Copyright (c) 2017 Akamai Technologies, Inc.
  *
  * This file is part of FFmpeg.
  *
@@ -19,16 +20,24 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <DeckLinkAPI.h>
+/* Include internal.h first to avoid conflict between winsock.h (used by
+ * DeckLink headers) and winsock2.h (used by libavformat) in MSVC++ builds */
+extern "C" {
+#include "libavformat/internal.h"
+}
 
-#include <pthread.h>
-#include <semaphore.h>
+#include <DeckLinkAPI.h>
 
 extern "C" {
 #include "config.h"
 #include "libavformat/avformat.h"
-#include "libavformat/internal.h"
+#include "libavutil/avassert.h"
+#include "libavutil/avutil.h"
+#include "libavutil/common.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/time.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/reverse.h"
 #if CONFIG_LIBZVBI
 #include <libzvbi.h>
 #endif
@@ -37,7 +46,6 @@ extern "C" {
 #include "decklink_common.h"
 #include "decklink_dec.h"
 
-#if CONFIG_LIBZVBI
 static uint8_t calc_parity_and_line_offset(int line)
 {
     uint8_t ret = (line < 313) << 5;
@@ -48,30 +56,144 @@ static uint8_t calc_parity_and_line_offset(int line)
     return ret;
 }
 
-int teletext_data_unit_from_vbi_data(int line, uint8_t *src, uint8_t *tgt)
+static void fill_data_unit_head(int line, uint8_t *tgt)
 {
-    vbi_bit_slicer slicer;
-
-    vbi_bit_slicer_init(&slicer, 720, 13500000, 6937500, 6937500, 0x00aaaae4, 0xffff, 18, 6, 42 * 8, VBI_MODULATION_NRZ_MSB, VBI_PIXFMT_UYVY);
-
-    if (vbi_bit_slice(&slicer, src, tgt + 4) == FALSE)
-        return -1;
-
     tgt[0] = 0x02; // data_unit_id
     tgt[1] = 0x2c; // data_unit_length
     tgt[2] = calc_parity_and_line_offset(line); // field_parity, line_offset
     tgt[3] = 0xe4; // framing code
+}
 
-    return 0;
+#if CONFIG_LIBZVBI
+static uint8_t* teletext_data_unit_from_vbi_data(int line, uint8_t *src, uint8_t *tgt, vbi_pixfmt fmt)
+{
+    vbi_bit_slicer slicer;
+
+    vbi_bit_slicer_init(&slicer, 720, 13500000, 6937500, 6937500, 0x00aaaae4, 0xffff, 18, 6, 42 * 8, VBI_MODULATION_NRZ_MSB, fmt);
+
+    if (vbi_bit_slice(&slicer, src, tgt + 4) == FALSE)
+        return tgt;
+
+    fill_data_unit_head(line, tgt);
+
+    return tgt + 46;
+}
+
+static uint8_t* teletext_data_unit_from_vbi_data_10bit(int line, uint8_t *src, uint8_t *tgt)
+{
+    uint8_t y[720];
+    uint8_t *py = y;
+    uint8_t *pend = y + 720;
+    /* The 10-bit VBI data is packed in V210, but libzvbi only supports 8-bit,
+     * so we extract the 8 MSBs of the luma component, that is enough for
+     * teletext bit slicing. */
+    while (py < pend) {
+        *py++ = (src[1] >> 4) + ((src[2] & 15) << 4);
+        *py++ = (src[4] >> 2) + ((src[5] & 3 ) << 6);
+        *py++ = (src[6] >> 6) + ((src[7] & 63) << 2);
+        src += 8;
+    }
+    return teletext_data_unit_from_vbi_data(line, y, tgt, VBI_PIXFMT_YUV420);
 }
 #endif
 
+static uint8_t* teletext_data_unit_from_op47_vbi_packet(int line, uint16_t *py, uint8_t *tgt)
+{
+    int i;
+
+    if (py[0] != 0x255 || py[1] != 0x255 || py[2] != 0x227)
+        return tgt;
+
+    fill_data_unit_head(line, tgt);
+
+    py += 3;
+    tgt += 4;
+
+    for (i = 0; i < 42; i++)
+       *tgt++ = ff_reverse[py[i] & 255];
+
+    return tgt;
+}
+
+static int linemask_matches(int line, int64_t mask)
+{
+    int shift = -1;
+    if (line >= 6 && line <= 22)
+        shift = line - 6;
+    if (line >= 318 && line <= 335)
+        shift = line - 318 + 17;
+    return shift >= 0 && ((1ULL << shift) & mask);
+}
+
+static uint8_t* teletext_data_unit_from_op47_data(uint16_t *py, uint16_t *pend, uint8_t *tgt, int64_t wanted_lines)
+{
+    if (py < pend - 9) {
+        if (py[0] == 0x151 && py[1] == 0x115 && py[3] == 0x102) {       // identifier, identifier, format code for WST teletext
+            uint16_t *descriptors = py + 4;
+            int i;
+            py += 9;
+            for (i = 0; i < 5 && py < pend - 45; i++, py += 45) {
+                int line = (descriptors[i] & 31) + (!(descriptors[i] & 128)) * 313;
+                if (line && linemask_matches(line, wanted_lines))
+                    tgt = teletext_data_unit_from_op47_vbi_packet(line, py, tgt);
+            }
+        }
+    }
+    return tgt;
+}
+
+static uint8_t* teletext_data_unit_from_ancillary_packet(uint16_t *py, uint16_t *pend, uint8_t *tgt, int64_t wanted_lines, int allow_multipacket)
+{
+    uint16_t did = py[0];                                               // data id
+    uint16_t sdid = py[1];                                              // secondary data id
+    uint16_t dc = py[2] & 255;                                          // data count
+    py += 3;
+    pend = FFMIN(pend, py + dc);
+    if (did == 0x143 && sdid == 0x102) {                                // subtitle distribution packet
+        tgt = teletext_data_unit_from_op47_data(py, pend, tgt, wanted_lines);
+    } else if (allow_multipacket && did == 0x143 && sdid == 0x203) {    // VANC multipacket
+        py += 2;                                                        // priority, line/field
+        while (py < pend - 3) {
+            tgt = teletext_data_unit_from_ancillary_packet(py, pend, tgt, wanted_lines, 0);
+            py += 4 + (py[2] & 255);                                    // ndid, nsdid, ndc, line/field
+        }
+    }
+    return tgt;
+}
+
+static uint8_t* teletext_data_unit_from_vanc_data(uint8_t *src, uint8_t *tgt, int64_t wanted_lines)
+{
+    uint16_t y[1920];
+    uint16_t *py = y;
+    uint16_t *pend = y + 1920;
+    /* The 10-bit VANC data is packed in V210, we only need the luma component. */
+    while (py < pend) {
+        *py++ = (src[1] >> 2) + ((src[2] & 15) << 6);
+        *py++ =  src[4]       + ((src[5] &  3) << 8);
+        *py++ = (src[6] >> 4) + ((src[7] & 63) << 4);
+        src += 8;
+    }
+    py = y;
+    while (py < pend - 6) {
+        if (py[0] == 0 && py[1] == 0x3ff && py[2] == 0x3ff) {           // ancillary data flag
+            py += 3;
+            tgt = teletext_data_unit_from_ancillary_packet(py, pend, tgt, wanted_lines, 0);
+            py += py[2] & 255;
+        } else {
+            py++;
+        }
+    }
+    return tgt;
+}
+
 static void avpacket_queue_init(AVFormatContext *avctx, AVPacketQueue *q)
 {
+    struct decklink_cctx *ctx = (struct decklink_cctx *)avctx->priv_data;
     memset(q, 0, sizeof(AVPacketQueue));
     pthread_mutex_init(&q->mutex, NULL);
     pthread_cond_init(&q->cond, NULL);
     q->avctx = avctx;
+    q->max_q_size = ctx->queue_size;
 }
 
 static void avpacket_queue_flush(AVPacketQueue *q)
@@ -111,8 +233,8 @@ static int avpacket_queue_put(AVPacketQueue *q, AVPacket *pkt)
 {
     AVPacketList *pkt1;
 
-    // Drop Packet if queue size is > 1GB
-    if (avpacket_queue_size(q) >  1024 * 1024 * 1024 ) {
+    // Drop Packet if queue size is > maximum queue size
+    if (avpacket_queue_size(q) > (uint64_t)q->max_q_size) {
         av_log(q->avctx, AV_LOG_WARNING,  "Decklink input buffer overrun!\n");
         return -1;
     }
@@ -202,8 +324,9 @@ private:
 decklink_input_callback::decklink_input_callback(AVFormatContext *_avctx) : m_refCount(0)
 {
     avctx = _avctx;
-    decklink_cctx       *cctx = (struct decklink_cctx *) avctx->priv_data;
-    ctx = (struct decklink_ctx *) cctx->ctx;
+    decklink_cctx       *cctx = (struct decklink_cctx *)avctx->priv_data;
+    ctx = (struct decklink_ctx *)cctx->ctx;
+    no_video = 0;
     initial_audio_pts = initial_video_pts = AV_NOPTS_VALUE;
     pthread_mutex_init(&m_mutex, NULL);
 }
@@ -236,6 +359,51 @@ ULONG decklink_input_callback::Release(void)
     return (ULONG)m_refCount;
 }
 
+static int64_t get_pkt_pts(IDeckLinkVideoInputFrame *videoFrame,
+                           IDeckLinkAudioInputPacket *audioFrame,
+                           int64_t wallclock,
+                           DecklinkPtsSource pts_src,
+                           AVRational time_base, int64_t *initial_pts)
+{
+    int64_t pts = AV_NOPTS_VALUE;
+    BMDTimeValue bmd_pts;
+    BMDTimeValue bmd_duration;
+    HRESULT res = E_INVALIDARG;
+    switch (pts_src) {
+        case PTS_SRC_AUDIO:
+            if (audioFrame)
+                res = audioFrame->GetPacketTime(&bmd_pts, time_base.den);
+            break;
+        case PTS_SRC_VIDEO:
+            if (videoFrame)
+                res = videoFrame->GetStreamTime(&bmd_pts, &bmd_duration, time_base.den);
+            break;
+        case PTS_SRC_REFERENCE:
+            if (videoFrame)
+                res = videoFrame->GetHardwareReferenceTimestamp(time_base.den, &bmd_pts, &bmd_duration);
+            break;
+        case PTS_SRC_WALLCLOCK:
+        {
+            /* MSVC does not support compound literals like AV_TIME_BASE_Q
+             * in C++ code (compiler error C4576) */
+            AVRational timebase;
+            timebase.num = 1;
+            timebase.den = AV_TIME_BASE;
+            pts = av_rescale_q(wallclock, timebase, time_base);
+            break;
+        }
+    }
+    if (res == S_OK)
+        pts = bmd_pts / time_base.num;
+
+    if (pts != AV_NOPTS_VALUE && *initial_pts == AV_NOPTS_VALUE)
+        *initial_pts = pts;
+    if (*initial_pts != AV_NOPTS_VALUE)
+        pts -= *initial_pts;
+
+    return pts;
+}
+
 HRESULT decklink_input_callback::VideoInputFrameArrived(
     IDeckLinkVideoInputFrame *videoFrame, IDeckLinkAudioInputPacket *audioFrame)
 {
@@ -243,8 +411,11 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
     void *audioFrameBytes;
     BMDTimeValue frameTime;
     BMDTimeValue frameDuration;
+    int64_t wallclock = 0;
 
     ctx->frameCount++;
+    if (ctx->audio_pts_source == PTS_SRC_WALLCLOCK || ctx->video_pts_source == PTS_SRC_WALLCLOCK)
+        wallclock = av_gettime_relative();
 
     // Handle Video Frame
     if (videoFrame) {
@@ -264,18 +435,18 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                                   ctx->video_st->time_base.den);
 
         if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
-            if (videoFrame->GetPixelFormat() == bmdFormat8BitYUV) {
-            unsigned bars[8] = {
-                0xEA80EA80, 0xD292D210, 0xA910A9A5, 0x90229035,
-                0x6ADD6ACA, 0x51EF515A, 0x286D28EF, 0x10801080 };
-            int width  = videoFrame->GetWidth();
-            int height = videoFrame->GetHeight();
-            unsigned *p = (unsigned *)frameBytes;
+            if (ctx->draw_bars && videoFrame->GetPixelFormat() == bmdFormat8BitYUV) {
+                unsigned bars[8] = {
+                    0xEA80EA80, 0xD292D210, 0xA910A9A5, 0x90229035,
+                    0x6ADD6ACA, 0x51EF515A, 0x286D28EF, 0x10801080 };
+                int width  = videoFrame->GetWidth();
+                int height = videoFrame->GetHeight();
+                unsigned *p = (unsigned *)frameBytes;
 
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x += 2)
-                    *p++ = bars[(x * 8) / width];
-            }
+                for (int y = 0; y < height; y++) {
+                    for (int x = 0; x < width; x += 2)
+                        *p++ = bars[(x * 8) / width];
+                }
             }
 
             if (!no_video) {
@@ -291,13 +462,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
             no_video = 0;
         }
 
-        pkt.pts = frameTime / ctx->video_st->time_base.num;
-
-        if (initial_video_pts == AV_NOPTS_VALUE) {
-            initial_video_pts = pkt.pts;
-        }
-
-        pkt.pts -= initial_video_pts;
+        pkt.pts = get_pkt_pts(videoFrame, audioFrame, wallclock, ctx->video_pts_source, ctx->video_st->time_base, &initial_video_pts);
         pkt.dts = pkt.pts;
 
         pkt.duration = frameDuration;
@@ -309,26 +474,47 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                            videoFrame->GetHeight();
         //fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
 
-#if CONFIG_LIBZVBI
-        if (!no_video && ctx->teletext_lines && videoFrame->GetPixelFormat() == bmdFormat8BitYUV && videoFrame->GetWidth() == 720) {
+        if (!no_video && ctx->teletext_lines) {
             IDeckLinkVideoFrameAncillary *vanc;
             AVPacket txt_pkt;
-            uint8_t txt_buf0[1611]; // max 35 * 46 bytes decoded teletext lines + 1 byte data_identifier
+            uint8_t txt_buf0[3531]; // 35 * 46 bytes decoded teletext lines + 1 byte data_identifier + 1920 bytes OP47 decode buffer
             uint8_t *txt_buf = txt_buf0;
 
             if (videoFrame->GetAncillaryData(&vanc) == S_OK) {
                 int i;
                 int64_t line_mask = 1;
+                BMDPixelFormat vanc_format = vanc->GetPixelFormat();
                 txt_buf[0] = 0x10;    // data_identifier - EBU_data
                 txt_buf++;
-                for (i = 6; i < 336; i++, line_mask <<= 1) {
-                    uint8_t *buf;
-                    if ((ctx->teletext_lines & line_mask) && vanc->GetBufferForVerticalBlankingLine(i, (void**)&buf) == S_OK) {
-                        if (teletext_data_unit_from_vbi_data(i, buf, txt_buf) >= 0)
-                            txt_buf += 46;
+#if CONFIG_LIBZVBI
+                if (ctx->bmd_mode == bmdModePAL && (vanc_format == bmdFormat8BitYUV || vanc_format == bmdFormat10BitYUV)) {
+                    av_assert0(videoFrame->GetWidth() == 720);
+                    for (i = 6; i < 336; i++, line_mask <<= 1) {
+                        uint8_t *buf;
+                        if ((ctx->teletext_lines & line_mask) && vanc->GetBufferForVerticalBlankingLine(i, (void**)&buf) == S_OK) {
+                            if (vanc_format == bmdFormat8BitYUV)
+                                txt_buf = teletext_data_unit_from_vbi_data(i, buf, txt_buf, VBI_PIXFMT_UYVY);
+                            else
+                                txt_buf = teletext_data_unit_from_vbi_data_10bit(i, buf, txt_buf);
+                        }
+                        if (i == 22)
+                            i = 317;
                     }
-                    if (i == 22)
-                        i = 317;
+                }
+#endif
+                if (videoFrame->GetWidth() == 1920 && vanc_format == bmdFormat10BitYUV) {
+                    int first_active_line = ctx->bmd_field_dominance == bmdProgressiveFrame ? 42 : 584;
+                    for (i = 8; i < first_active_line; i++) {
+                        uint8_t *buf;
+                        if (vanc->GetBufferForVerticalBlankingLine(i, (void**)&buf) == S_OK)
+                            txt_buf = teletext_data_unit_from_vanc_data(buf, txt_buf, ctx->teletext_lines);
+                        if (ctx->bmd_field_dominance != bmdProgressiveFrame && i == 20)     // skip field1 active lines
+                            i = 569;
+                        if (txt_buf - txt_buf0 > 1611) {   // ensure we still have at least 1920 bytes free in the buffer
+                            av_log(avctx, AV_LOG_ERROR, "Too many OP47 teletext packets.\n");
+                            break;
+                        }
+                    }
                 }
                 vanc->Release();
                 if (txt_buf - txt_buf0 > 1) {
@@ -350,7 +536,6 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                 }
             }
         }
-#endif
 
         if (avpacket_queue_put(&ctx->queue, &pkt) < 0) {
             ++ctx->dropped;
@@ -367,13 +552,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
         pkt.size = audioFrame->GetSampleFrameCount() * ctx->audio_st->codecpar->channels * (16 / 8);
         audioFrame->GetBytes(&audioFrameBytes);
         audioFrame->GetPacketTime(&audio_pts, ctx->audio_st->time_base.den);
-        pkt.pts = audio_pts / ctx->audio_st->time_base.num;
-
-        if (initial_audio_pts == AV_NOPTS_VALUE) {
-            initial_audio_pts = pkt.pts;
-        }
-
-        pkt.pts -= initial_audio_pts;
+        pkt.pts = get_pkt_pts(videoFrame, audioFrame, wallclock, ctx->audio_pts_source, ctx->audio_st->time_base, &initial_audio_pts);
         pkt.dts = pkt.pts;
 
         //fprintf(stderr,"Audio Frame size %d ts %d\n", pkt.size, pkt.pts);
@@ -398,8 +577,8 @@ HRESULT decklink_input_callback::VideoInputFormatChanged(
 
 static HRESULT decklink_start_input(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *) cctx->ctx;
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
     ctx->input_callback = new decklink_input_callback(avctx);
     ctx->dli->SetCallback(ctx->input_callback);
@@ -410,8 +589,8 @@ extern "C" {
 
 av_cold int ff_decklink_read_close(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *) cctx->ctx;
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
     if (ctx->capture_started) {
         ctx->dli->StopStreams();
@@ -419,11 +598,7 @@ av_cold int ff_decklink_read_close(AVFormatContext *avctx)
         ctx->dli->DisableAudioInput();
     }
 
-    if (ctx->dli)
-        ctx->dli->Release();
-    if (ctx->dl)
-        ctx->dl->Release();
-
+    ff_decklink_cleanup(avctx);
     avpacket_queue_end(&ctx->queue);
 
     av_freep(&cctx->ctx);
@@ -433,16 +608,14 @@ av_cold int ff_decklink_read_close(AVFormatContext *avctx)
 
 av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx;
-    IDeckLinkDisplayModeIterator *itermode;
-    IDeckLinkIterator *iter;
-    IDeckLink *dl = NULL;
     AVStream *st;
     HRESULT result;
     char fname[1024];
     char *tmp;
     int mode_num = 0;
+    int ret;
 
     ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
     if (!ctx)
@@ -451,14 +624,15 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     ctx->list_formats = cctx->list_formats;
     ctx->teletext_lines = cctx->teletext_lines;
     ctx->preroll      = cctx->preroll;
+    ctx->duplex_mode  = cctx->duplex_mode;
+    if (cctx->video_input > 0 && (unsigned int)cctx->video_input < FF_ARRAY_ELEMS(decklink_video_connection_map))
+        ctx->video_input = decklink_video_connection_map[cctx->video_input];
+    if (cctx->audio_input > 0 && (unsigned int)cctx->audio_input < FF_ARRAY_ELEMS(decklink_audio_connection_map))
+        ctx->audio_input = decklink_audio_connection_map[cctx->audio_input];
+    ctx->audio_pts_source = cctx->audio_pts_source;
+    ctx->video_pts_source = cctx->video_pts_source;
+    ctx->draw_bars = cctx->draw_bars;
     cctx->ctx = ctx;
-
-#if !CONFIG_LIBZVBI
-    if (ctx->teletext_lines) {
-        av_log(avctx, AV_LOG_ERROR, "Libzvbi support is needed for capturing teletext, please recompile FFmpeg.\n");
-        return AVERROR(ENOSYS);
-    }
-#endif
 
     /* Check audio channel option for valid values: 2, 8 or 16 */
     switch (cctx->audio_channels) {
@@ -471,12 +645,6 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
             return AVERROR(EINVAL);
     }
 
-    iter = CreateDeckLinkIteratorInstance();
-    if (!iter) {
-        av_log(avctx, AV_LOG_ERROR, "Could not create DeckLink iterator\n");
-        return AVERROR(EIO);
-    }
-
     /* List available devices. */
     if (ctx->list_devices) {
         ff_decklink_list_devices(avctx);
@@ -486,63 +654,52 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     strcpy (fname, avctx->filename);
     tmp=strchr (fname, '@');
     if (tmp != NULL) {
+        av_log(avctx, AV_LOG_WARNING, "The @mode syntax is deprecated and will be removed. Please use the -format_code option.\n");
         mode_num = atoi (tmp+1);
         *tmp = 0;
     }
 
-    /* Open device. */
-    while (iter->Next(&dl) == S_OK) {
-        const char *displayName;
-        ff_decklink_get_display_name(dl, &displayName);
-        if (!strcmp(fname, displayName)) {
-            av_free((void *) displayName);
-            ctx->dl = dl;
-            break;
-        }
-        av_free((void *) displayName);
-        dl->Release();
-    }
-    iter->Release();
-    if (!ctx->dl) {
-        av_log(avctx, AV_LOG_ERROR, "Could not open '%s'\n", fname);
-        return AVERROR(EIO);
-    }
+    ret = ff_decklink_init_device(avctx, fname);
+    if (ret < 0)
+        return ret;
 
     /* Get input device. */
     if (ctx->dl->QueryInterface(IID_IDeckLinkInput, (void **) &ctx->dli) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not open output device from '%s'\n",
+        av_log(avctx, AV_LOG_ERROR, "Could not open input device from '%s'\n",
                avctx->filename);
-        ctx->dl->Release();
-        return AVERROR(EIO);
+        ret = AVERROR(EIO);
+        goto error;
     }
 
     /* List supported formats. */
     if (ctx->list_formats) {
         ff_decklink_list_formats(avctx, DIRECTION_IN);
-        ctx->dli->Release();
-        ctx->dl->Release();
-        return AVERROR_EXIT;
+        ret = AVERROR_EXIT;
+        goto error;
     }
 
-    if (ctx->dli->GetDisplayModeIterator(&itermode) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not get Display Mode Iterator\n");
-        ctx->dl->Release();
-        return AVERROR(EIO);
-    }
-
-    if (mode_num > 0) {
+    if (mode_num > 0 || cctx->format_code) {
         if (ff_decklink_set_format(avctx, DIRECTION_IN, mode_num) < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Could not set mode %d for %s\n", mode_num, fname);
+            av_log(avctx, AV_LOG_ERROR, "Could not set mode number %d or format code %s for %s\n",
+                mode_num, (cctx->format_code) ? cctx->format_code : "(unset)", fname);
+            ret = AVERROR(EIO);
             goto error;
         }
     }
 
-    itermode->Release();
+#if !CONFIG_LIBZVBI
+    if (ctx->teletext_lines && ctx->bmd_mode == bmdModePAL) {
+        av_log(avctx, AV_LOG_ERROR, "Libzvbi support is needed for capturing SD PAL teletext, please recompile FFmpeg.\n");
+        ret = AVERROR(ENOSYS);
+        goto error;
+    }
+#endif
 
     /* Setup streams. */
     st = avformat_new_stream(avctx, NULL);
     if (!st) {
         av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
+        ret = AVERROR(ENOMEM);
         goto error;
     }
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
@@ -555,6 +712,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     st = avformat_new_stream(avctx, NULL);
     if (!st) {
         av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
+        ret = AVERROR(ENOMEM);
         goto error;
     }
     st->codecpar->codec_type  = AVMEDIA_TYPE_VIDEO;
@@ -563,15 +721,30 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 
     st->time_base.den      = ctx->bmd_tb_den;
     st->time_base.num      = ctx->bmd_tb_num;
-    st->codecpar->bit_rate    = av_image_get_buffer_size((AVPixelFormat)st->codecpar->format, ctx->bmd_width, ctx->bmd_height, 1) * 1/av_q2d(st->time_base) * 8;
+    av_stream_set_r_frame_rate(st, av_make_q(st->time_base.den, st->time_base.num));
 
     if (cctx->v210) {
         st->codecpar->codec_id    = AV_CODEC_ID_V210;
         st->codecpar->codec_tag   = MKTAG('V', '2', '1', '0');
+        st->codecpar->bit_rate    = av_rescale(ctx->bmd_width * ctx->bmd_height * 64, st->time_base.den, st->time_base.num * 3);
     } else {
         st->codecpar->codec_id    = AV_CODEC_ID_RAWVIDEO;
         st->codecpar->format      = AV_PIX_FMT_UYVY422;
         st->codecpar->codec_tag   = MKTAG('U', 'Y', 'V', 'Y');
+        st->codecpar->bit_rate    = av_rescale(ctx->bmd_width * ctx->bmd_height * 16, st->time_base.den, st->time_base.num);
+    }
+
+    switch (ctx->bmd_field_dominance) {
+    case bmdUpperFieldFirst:
+        st->codecpar->field_order = AV_FIELD_TT;
+        break;
+    case bmdLowerFieldFirst:
+        st->codecpar->field_order = AV_FIELD_BB;
+        break;
+    case bmdProgressiveFrame:
+    case bmdProgressiveSegmentedFrame:
+        st->codecpar->field_order = AV_FIELD_PROGRESSIVE;
+        break;
     }
 
     avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
@@ -582,6 +755,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
         st = avformat_new_stream(avctx, NULL);
         if (!st) {
             av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
+            ret = AVERROR(ENOMEM);
             goto error;
         }
         st->codecpar->codec_type  = AVMEDIA_TYPE_SUBTITLE;
@@ -597,6 +771,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 
     if (result != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Cannot enable audio input\n");
+        ret = AVERROR(EIO);
         goto error;
     }
 
@@ -606,6 +781,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 
     if (result != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Cannot enable video input\n");
+        ret = AVERROR(EIO);
         goto error;
     }
 
@@ -613,32 +789,23 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 
     if (decklink_start_input (avctx) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Cannot start input stream\n");
+        ret = AVERROR(EIO);
         goto error;
     }
 
     return 0;
 
 error:
-
-    ctx->dli->Release();
-    ctx->dl->Release();
-
-    return AVERROR(EIO);
+    ff_decklink_cleanup(avctx);
+    return ret;
 }
 
 int ff_decklink_read_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *) cctx->ctx;
-    AVFrame *frame = ctx->video_st->codec->coded_frame;
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
     avpacket_queue_get(&ctx->queue, pkt, 1);
-    if (frame && (ctx->bmd_field_dominance == bmdUpperFieldFirst || ctx->bmd_field_dominance == bmdLowerFieldFirst)) {
-        frame->interlaced_frame = 1;
-        if (ctx->bmd_field_dominance == bmdUpperFieldFirst) {
-            frame->top_field_first = 1;
-        }
-    }
 
     return 0;
 }

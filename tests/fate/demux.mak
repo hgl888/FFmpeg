@@ -1,8 +1,9 @@
 FATE_SAMPLES_DEMUX-$(call DEMDEC, AVI, FRAPS) += fate-avio-direct
 fate-avio-direct: CMD = framecrc -avioflags direct -i $(TARGET_SAMPLES)/fraps/fraps-v5-bouncing-balls-partial.avi -avioflags direct
 
-FATE_SAMPLES_DEMUX-$(CONFIG_AAC_DEMUXER) += fate-adts-demux
+FATE_SAMPLES_DEMUX-$(call DEMDEC, AAC, AAC) += fate-adts-demux fate-adts-id3v1-demux
 fate-adts-demux: CMD = crc -i $(TARGET_SAMPLES)/aac/ct_faac-adts.aac -acodec copy
+fate-adts-id3v1-demux: CMD = framecrc -f aac -i $(TARGET_SAMPLES)/aac/id3v1.aac -acodec copy
 
 FATE_SAMPLES_DEMUX-$(CONFIG_AEA_DEMUXER) += fate-aea-demux
 fate-aea-demux: CMD = crc -i $(TARGET_SAMPLES)/aea/chirp.aea -acodec copy
@@ -35,19 +36,23 @@ fate-d-cinema-demux: CMD = framecrc -i $(TARGET_SAMPLES)/d-cinema/THX_Science_FL
 FATE_SAMPLES_DEMUX-$(CONFIG_EA_DEMUXER) += fate-d-eavp6-demux
 fate-d-eavp6-demux: CMD = framecrc -i $(TARGET_SAMPLES)/ea-vp6/SmallRing.vp6 -map 0 -vcodec copy
 
+FATE_SAMPLES_DEMUX-$(CONFIG_FITS_DEMUXER) += fate-fits-demux
+fate-fits-demux: tests/data/fits-multi.fits
+fate-fits-demux: CMD = framecrc -i $(TARGET_PATH)/tests/data/fits-multi.fits -vcodec copy
+
 FATE_SAMPLES_DEMUX-$(CONFIG_FLV_DEMUXER) += fate-flv-demux
 fate-flv-demux: CMD = framecrc -i $(TARGET_SAMPLES)/flv/Enigma_Principles_of_Lust-part.flv -codec copy
 
 FATE_SAMPLES_DEMUX-$(CONFIG_GIF_DEMUXER) += fate-gif-demux
 fate-gif-demux: CMD = framecrc -i $(TARGET_SAMPLES)/gif/Newtons_cradle_animation_book_2.gif -vcodec copy
 
-FATE_SAMPLES_DEMUX-$(CONFIG_IV8_DEMUXER) += fate-iv8-demux
+FATE_SAMPLES_DEMUX-$(call ALLYES, IV8_DEMUXER MPEG4VIDEO_PARSER) += fate-iv8-demux
 fate-iv8-demux: CMD = framecrc -i $(TARGET_SAMPLES)/iv8/zzz-partial.mpg -vcodec copy
 
 FATE_SAMPLES_DEMUX-$(CONFIG_JV_DEMUXER) += fate-jv-demux
 fate-jv-demux: CMD = framecrc -i $(TARGET_SAMPLES)/jv/intro.jv -vcodec copy -acodec copy
 
-FATE_SAMPLES_DEMUX-$(CONFIG_LMLM4_DEMUXER) += fate-lmlm4-demux
+FATE_SAMPLES_DEMUX-$(call ALLYES, LMLM4_DEMUXER MPEG4VIDEO_PARSER) += fate-lmlm4-demux
 fate-lmlm4-demux: CMD = framecrc -i $(TARGET_SAMPLES)/lmlm4/LMLM4_CIFat30fps.divx -t 3 -acodec copy -vcodec copy
 
 FATE_SAMPLES_DEMUX-$(CONFIG_XA_DEMUXER) += fate-maxis-xa
@@ -58,7 +63,7 @@ fate-mkv: CMD = framecrc -i $(TARGET_SAMPLES)/mkv/test7_cut.mkv -c copy
 
 #No dts errors or duplicate DTS should be in this
 FATE_SAMPLES_DEMUX-$(call DEMDEC, MATROSKA, H264) += fate-mkv-1242
-fate-mkv-1242: CMD = framecrc -i $(TARGET_SAMPLES)/mkv/1242-small.mkv -c copy -vframes 11
+fate-mkv-1242: CMD = framecrc -i $(TARGET_SAMPLES)/mkv/1242-small.mkv -c copy -frames:v 11
 
 FATE_SAMPLES_DEMUX-$(CONFIG_MLV_DEMUXER) += fate-mlv-demux
 fate-mlv-demux: CMD = crc -i $(TARGET_SAMPLES)/mlv/M19-0333-cut.MLV -c copy
@@ -72,10 +77,10 @@ fate-ts-opus-demux: CMD = framecrc -i $(TARGET_SAMPLES)/opus/test-8-7.1.opus-sma
 FATE_SAMPLES_DEMUX-$(CONFIG_MTV_DEMUXER) += fate-mtv
 fate-mtv: CMD = framecrc -i $(TARGET_SAMPLES)/mtv/comedian_auto-partial.mtv -c copy
 
-FATE_SAMPLES_DEMUX-$(CONFIG_MXF_DEMUXER) += fate-mxf-demux
+FATE_SAMPLES_DEMUX-$(call DEMDEC, MXF, MPEG4) += fate-mxf-demux
 fate-mxf-demux: CMD = framecrc -i $(TARGET_SAMPLES)/mxf/C0023S01.mxf -acodec copy -vcodec copy
 
-FATE_SAMPLES_DEMUX-$(CONFIG_NC_DEMUXER) += fate-nc-demux
+FATE_SAMPLES_DEMUX-$(call ALLYES, NC_DEMUXER MPEG4VIDEO_PARSER) += fate-nc-demux
 fate-nc-demux: CMD = framecrc -i $(TARGET_SAMPLES)/nc-camera/nc-sample-partial -vcodec copy
 
 FATE_SAMPLES_DEMUX-$(CONFIG_NISTSPHERE_DEMUXER) += fate-nistsphere-demux
@@ -129,7 +134,7 @@ fate-wav-ac3: CMD = framecrc -i $(TARGET_SAMPLES)/ac3/diatonis_invisible_order_a
 FATE_SAMPLES_DEMUX-$(CONFIG_WSAUD_DEMUXER) += fate-westwood-aud
 fate-westwood-aud: CMD = framecrc -i $(TARGET_SAMPLES)/westwood-aud/excellent.aud -c copy
 
-FATE_SAMPLES_DEMUX-$(CONFIG_WTV_DEMUXER) += fate-wtv-demux
+FATE_SAMPLES_DEMUX-$(call ALLYES, WTV_DEMUXER MPEGVIDEO_PARSER) += fate-wtv-demux
 fate-wtv-demux: CMD = framecrc -i $(TARGET_SAMPLES)/wtv/law-and-order-partial.wtv -vcodec copy -acodec copy
 
 FATE_SAMPLES_DEMUX-$(CONFIG_XMV_DEMUXER) += fate-xmv-demux

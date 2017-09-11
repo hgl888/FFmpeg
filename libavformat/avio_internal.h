@@ -53,14 +53,6 @@ int ffio_init_context(AVIOContext *s,
  */
 int ffio_read_indirect(AVIOContext *s, unsigned char *buf, int size, const unsigned char **data);
 
-/**
- * Read size bytes from AVIOContext into buf.
- * This reads at most 1 packet. If that is not enough fewer bytes will be
- * returned.
- * @return number of bytes read or AVERROR
- */
-int ffio_read_partial(AVIOContext *s, unsigned char *buf, int size);
-
 void ffio_fill(AVIOContext *s, int b, int count);
 
 static av_always_inline void ffio_wfourcc(AVIOContext *pb, const uint8_t *s)
@@ -110,6 +102,8 @@ void ffio_init_checksum(AVIOContext *s,
                         unsigned long checksum);
 unsigned long ffio_get_checksum(AVIOContext *s);
 unsigned long ff_crc04C11DB7_update(unsigned long checksum, const uint8_t *buf,
+                                    unsigned int len);
+unsigned long ff_crcEDB88320_update(unsigned long checksum, const uint8_t *buf,
                                     unsigned int len);
 unsigned long ff_crcA001_update(unsigned long checksum, const uint8_t *buf,
                                 unsigned int len);

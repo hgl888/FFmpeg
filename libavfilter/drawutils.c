@@ -64,6 +64,8 @@ int ff_fill_rgba_map(uint8_t *rgba_map, enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_GBRP16LE:
     case AV_PIX_FMT_GBRP16BE:
     case AV_PIX_FMT_GBRAP:
+    case AV_PIX_FMT_GBRAP10LE:
+    case AV_PIX_FMT_GBRAP10BE:
     case AV_PIX_FMT_GBRAP12LE:
     case AV_PIX_FMT_GBRAP12BE:
     case AV_PIX_FMT_GBRAP16LE:
@@ -184,6 +186,8 @@ int ff_draw_init(FFDrawContext *draw, enum AVPixelFormat format, unsigned flags)
         return AVERROR(EINVAL);
     if (desc->flags & ~(AV_PIX_FMT_FLAG_PLANAR | AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PSEUDOPAL | AV_PIX_FMT_FLAG_ALPHA))
         return AVERROR(ENOSYS);
+    if (format == AV_PIX_FMT_P010LE || format == AV_PIX_FMT_P010BE)
+        return AVERROR(ENOSYS);
     for (i = 0; i < desc->nb_components; i++) {
         c = &desc->comp[i];
         /* for now, only 8-16 bits formats */
@@ -209,10 +213,11 @@ int ff_draw_init(FFDrawContext *draw, enum AVPixelFormat format, unsigned flags)
     draw->desc      = desc;
     draw->format    = format;
     draw->nb_planes = nb_planes;
+    draw->flags     = flags;
     memcpy(draw->pixelstep, pixelstep, sizeof(draw->pixelstep));
     draw->hsub[1] = draw->hsub[2] = draw->hsub_max = desc->log2_chroma_w;
     draw->vsub[1] = draw->vsub[2] = draw->vsub_max = desc->log2_chroma_h;
-    for (i = 0; i < (desc->nb_components - !!(desc->flags & AV_PIX_FMT_FLAG_ALPHA)); i++)
+    for (i = 0; i < (desc->nb_components - !!(desc->flags & AV_PIX_FMT_FLAG_ALPHA && !(flags & FF_DRAW_PROCESS_ALPHA))); i++)
         draw->comp_mask[desc->comp[i].plane] |=
             1 << desc->comp[i].offset;
     return 0;
@@ -251,19 +256,22 @@ void ff_draw_color(FFDrawContext *draw, FFDrawColor *color, const uint8_t rgba[4
 #define EXPAND(compn) \
         if (desc->comp[compn].depth > 8) \
             color->comp[desc->comp[compn].plane].u16[desc->comp[compn].offset] = \
-            color->comp[desc->comp[compn].plane].u8[desc->comp[compn].offset] << (draw->desc->comp[compn].depth - 8)
+            color->comp[desc->comp[compn].plane].u8[desc->comp[compn].offset] << \
+                (draw->desc->comp[compn].depth + draw->desc->comp[compn].shift - 8)
         EXPAND(3);
         EXPAND(2);
         EXPAND(1);
         EXPAND(0);
-    } else if (draw->format == AV_PIX_FMT_GRAY8 || draw->format == AV_PIX_FMT_GRAY8A) {
+    } else if (draw->format == AV_PIX_FMT_GRAY8 || draw->format == AV_PIX_FMT_GRAY8A ||
+               draw->format == AV_PIX_FMT_GRAY16LE || draw->format == AV_PIX_FMT_YA16LE ||
+               draw->format == AV_PIX_FMT_GRAY9LE  ||
+               draw->format == AV_PIX_FMT_GRAY10LE ||
+               draw->format == AV_PIX_FMT_GRAY12LE) {
+        const AVPixFmtDescriptor *desc = draw->desc;
         color->comp[0].u8[0] = RGB_TO_Y_CCIR(rgba[0], rgba[1], rgba[2]);
+        EXPAND(0);
         color->comp[1].u8[0] = rgba[3];
-    } else if (draw->format == AV_PIX_FMT_GRAY16LE || draw->format == AV_PIX_FMT_YA16LE) {
-        color->comp[0].u8[0] = RGB_TO_Y_CCIR(rgba[0], rgba[1], rgba[2]);
-        color->comp[0].u16[0] = color->comp[0].u8[0] << 8;
-        color->comp[1].u8[0] = rgba[3];
-        color->comp[1].u16[0] = color->comp[1].u8[0] << 8;
+        EXPAND(1);
     } else {
         av_log(NULL, AV_LOG_WARNING,
                "Color conversion not implemented for %s\n", draw->desc->name);
@@ -449,7 +457,8 @@ void ff_blend_rectangle(FFDrawContext *draw, FFDrawColor *color,
         /* 0x101 * alpha is in the [ 2 ; 0x1001] range */
         alpha = 0x101 * color->rgba[3] + 0x2;
     }
-    nb_planes = draw->nb_planes - !!(draw->desc->flags & AV_PIX_FMT_FLAG_ALPHA);
+    nb_planes = draw->nb_planes - !!(draw->desc->flags & AV_PIX_FMT_FLAG_ALPHA && !(draw->flags & FF_DRAW_PROCESS_ALPHA));
+    nb_planes += !nb_planes;
     for (plane = 0; plane < nb_planes; plane++) {
         nb_comp = draw->pixelstep[plane];
         p0 = pointer_at(draw, dst, dst_linesize, plane, x0, y0);
@@ -626,7 +635,8 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
     } else {
         alpha = (0x101 * color->rgba[3] + 0x2) >> 8;
     }
-    nb_planes = draw->nb_planes - !!(draw->desc->flags & AV_PIX_FMT_FLAG_ALPHA);
+    nb_planes = draw->nb_planes - !!(draw->desc->flags & AV_PIX_FMT_FLAG_ALPHA && !(draw->flags & FF_DRAW_PROCESS_ALPHA));
+    nb_planes += !nb_planes;
     for (plane = 0; plane < nb_planes; plane++) {
         nb_comp = draw->pixelstep[plane];
         p0 = pointer_at(draw, dst, dst_linesize, plane, x0, y0);

@@ -41,7 +41,7 @@
 #include "libavutil/opt.h"
 #include "avfilter.h"
 #include "formats.h"
-#include "framesync.h"
+#include "framesync2.h"
 #include "internal.h"
 #include "video.h"
 
@@ -75,6 +75,17 @@ static int query_formats(AVFilterContext *ctx)
         AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
         AV_PIX_FMT_ARGB, AV_PIX_FMT_ABGR, AV_PIX_FMT_RGBA, AV_PIX_FMT_BGRA,
         AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP,
+        AV_PIX_FMT_YUV444P9, AV_PIX_FMT_YUV444P10, AV_PIX_FMT_YUV444P12,
+        AV_PIX_FMT_YUV444P14, AV_PIX_FMT_YUV444P16,
+        AV_PIX_FMT_YUVA444P9, AV_PIX_FMT_YUVA444P10, AV_PIX_FMT_YUVA444P16,
+        AV_PIX_FMT_GBRP9, AV_PIX_FMT_GBRP10, AV_PIX_FMT_GBRP12,
+        AV_PIX_FMT_GBRP14, AV_PIX_FMT_GBRP16,
+        AV_PIX_FMT_GBRAP10, AV_PIX_FMT_GBRAP12, AV_PIX_FMT_GBRAP16,
+        AV_PIX_FMT_RGB48, AV_PIX_FMT_BGR48,
+        AV_PIX_FMT_RGBA64, AV_PIX_FMT_BGRA64,
+        AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9,
+        AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12,
+        AV_PIX_FMT_GRAY16,
         AV_PIX_FMT_NONE
     };
     static const enum AVPixelFormat map_fmts[] = {
@@ -141,6 +152,37 @@ static void remap_planar(RemapContext *s, const AVFrame *in,
     }
 }
 
+static void remap_planar16(RemapContext *s, const AVFrame *in,
+                           const AVFrame *xin, const AVFrame *yin,
+                           AVFrame *out)
+{
+    const int xlinesize = xin->linesize[0] / 2;
+    const int ylinesize = yin->linesize[0] / 2;
+    int x , y, plane;
+
+    for (plane = 0; plane < s->nb_planes ; plane++) {
+        uint16_t *dst        = (uint16_t *)out->data[plane];
+        const int dlinesize  = out->linesize[plane] / 2;
+        const uint16_t *src  = (const uint16_t *)in->data[plane];
+        const int slinesize  = in->linesize[plane] / 2;
+        const uint16_t *xmap = (const uint16_t *)xin->data[0];
+        const uint16_t *ymap = (const uint16_t *)yin->data[0];
+
+        for (y = 0; y < out->height; y++) {
+            for (x = 0; x < out->width; x++) {
+                if (ymap[x] < in->height && xmap[x] < in->width) {
+                    dst[x] = src[ymap[x] * slinesize + xmap[x]];
+                } else {
+                    dst[x] = 0;
+                }
+            }
+            dst  += dlinesize;
+            xmap += xlinesize;
+            ymap += ylinesize;
+        }
+    }
+}
+
 /**
  * remap_packed algorithm expects pixels with both padded bits (step) and
  * number of components correctly set.
@@ -178,6 +220,37 @@ static void remap_packed(RemapContext *s, const AVFrame *in,
     }
 }
 
+static void remap_packed16(RemapContext *s, const AVFrame *in,
+                           const AVFrame *xin, const AVFrame *yin,
+                           AVFrame *out)
+{
+    uint16_t *dst = (uint16_t *)out->data[0];
+    const uint16_t *src  = (const uint16_t *)in->data[0];
+    const int dlinesize = out->linesize[0] / 2;
+    const int slinesize = in->linesize[0] / 2;
+    const int xlinesize = xin->linesize[0] / 2;
+    const int ylinesize = yin->linesize[0] / 2;
+    const uint16_t *xmap = (const uint16_t *)xin->data[0];
+    const uint16_t *ymap = (const uint16_t *)yin->data[0];
+    const int step = s->step / 2;
+    int c, x, y;
+
+    for (y = 0; y < out->height; y++) {
+        for (x = 0; x < out->width; x++) {
+            for (c = 0; c < s->nb_components; c++) {
+                if (ymap[x] < in->height && xmap[x] < in->width) {
+                    dst[x * step + c] = src[ymap[x] * slinesize + xmap[x] * step + c];
+                } else {
+                    dst[x * step + c] = 0;
+                }
+            }
+        }
+        dst  += dlinesize;
+        xmap += xlinesize;
+        ymap += ylinesize;
+    }
+}
+
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -187,10 +260,18 @@ static int config_input(AVFilterLink *inlink)
     s->nb_planes = av_pix_fmt_count_planes(inlink->format);
     s->nb_components = desc->nb_components;
 
-    if (s->nb_planes > 1 || s->nb_components == 1) {
-        s->remap = remap_planar;
+    if (desc->comp[0].depth == 8) {
+        if (s->nb_planes > 1 || s->nb_components == 1) {
+            s->remap = remap_planar;
+        } else {
+            s->remap = remap_packed;
+        }
     } else {
-        s->remap = remap_packed;
+        if (s->nb_planes > 1 || s->nb_components == 1) {
+            s->remap = remap_planar16;
+        } else {
+            s->remap = remap_packed16;
+        }
     }
 
     s->step = av_get_padded_bits_per_pixel(desc) >> 3;
@@ -205,9 +286,9 @@ static int process_frame(FFFrameSync *fs)
     AVFrame *out, *in, *xpic, *ypic;
     int ret;
 
-    if ((ret = ff_framesync_get_frame(&s->fs, 0, &in,   0)) < 0 ||
-        (ret = ff_framesync_get_frame(&s->fs, 1, &xpic, 0)) < 0 ||
-        (ret = ff_framesync_get_frame(&s->fs, 2, &ypic, 0)) < 0)
+    if ((ret = ff_framesync2_get_frame(&s->fs, 0, &in,   0)) < 0 ||
+        (ret = ff_framesync2_get_frame(&s->fs, 1, &xpic, 0)) < 0 ||
+        (ret = ff_framesync2_get_frame(&s->fs, 2, &ypic, 0)) < 0)
         return ret;
 
     if (ctx->is_disabled) {
@@ -252,7 +333,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->sample_aspect_ratio = srclink->sample_aspect_ratio;
     outlink->frame_rate = srclink->frame_rate;
 
-    ret = ff_framesync_init(&s->fs, ctx, 3);
+    ret = ff_framesync2_init(&s->fs, ctx, 3);
     if (ret < 0)
         return ret;
 
@@ -272,44 +353,36 @@ static int config_output(AVFilterLink *outlink)
     s->fs.opaque   = s;
     s->fs.on_event = process_frame;
 
-    return ff_framesync_configure(&s->fs);
+    return ff_framesync2_configure(&s->fs);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
+static int activate(AVFilterContext *ctx)
 {
-    RemapContext *s = inlink->dst->priv;
-    return ff_framesync_filter_frame(&s->fs, inlink, buf);
+    RemapContext *s = ctx->priv;
+    return ff_framesync2_activate(&s->fs);
 }
 
-static int request_frame(AVFilterLink *outlink)
-{
-    RemapContext *s = outlink->src->priv;
-    return ff_framesync_request_frame(&s->fs, outlink);
-}
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
     RemapContext *s = ctx->priv;
 
-    ff_framesync_uninit(&s->fs);
+    ff_framesync2_uninit(&s->fs);
 }
 
 static const AVFilterPad remap_inputs[] = {
     {
         .name         = "source",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
         .config_props = config_input,
     },
     {
         .name         = "xmap",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
     },
     {
         .name         = "ymap",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
     },
     { NULL }
 };
@@ -319,17 +392,17 @@ static const AVFilterPad remap_outputs[] = {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_output,
-        .request_frame = request_frame,
     },
     { NULL }
 };
 
 AVFilter ff_vf_remap = {
     .name          = "remap",
-    .description   = NULL_IF_CONFIG_SMALL("Remap pixels"),
+    .description   = NULL_IF_CONFIG_SMALL("Remap pixels."),
     .priv_size     = sizeof(RemapContext),
     .uninit        = uninit,
     .query_formats = query_formats,
+    .activate      = activate,
     .inputs        = remap_inputs,
     .outputs       = remap_outputs,
     .priv_class    = &remap_class,

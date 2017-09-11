@@ -193,6 +193,8 @@ static int rtmp_open(URLContext *s, const char *uri, int flags)
 
             if (sep)
                 p = sep + 1;
+            else
+                break;
         }
     }
     if (ctx->playpath) {
@@ -237,7 +239,10 @@ static int rtmp_open(URLContext *s, const char *uri, int flags)
 #if CONFIG_NETWORK
     if (ctx->buffer_size >= 0 && (flags & AVIO_FLAG_WRITE)) {
         int tmp = ctx->buffer_size;
-        setsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_SNDBUF, &tmp, sizeof(tmp));
+        if (setsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_SNDBUF, &tmp, sizeof(tmp))) {
+            rc = AVERROR_EXTERNAL;
+            goto fail;
+        }
     }
 #endif
 
